@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VitalTrack</title>
+<style>
+  :root { --bg:#111; --card:#1e1e1e; --text:#eee; --muted:#aaa; --dim:#888; --green:#4CAF50; --amber:#e0a030; --red:#e05a5a; }
+  * { box-sizing: border-box; }
+  body { font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0 auto; padding: 20px 16px 40px; max-width: 520px; }
+  h2 { color: var(--green); margin: 4px 0 12px; }
+  .card { background: var(--card); border-radius: 10px; padding: 14px; margin: 10px 0; }
+  .k { color: var(--muted); font-size: 13px; margin-bottom: 4px; }
+  .v { font-size: 28px; font-weight: bold; }
+  .m { color: var(--muted); font-size: 14px; margin-top: 6px; min-height: 1em; }
+  .err { color: var(--red); }
+  input { width: 100%; padding: 14px; border-radius: 8px; border: none; font-size: 18px; margin: 6px 0; }
+  input.id { letter-spacing: 4px; font-size: 20px; }
+  button { width: 100%; padding: 14px; background: var(--green); color: #fff; border: none; border-radius: 8px; font-size: 17px; margin-top: 6px; cursor: pointer; }
+  button:disabled { opacity: .6; }
+  a.logout { float: right; color: var(--dim); font-size: 14px; font-weight: normal; cursor: pointer; text-decoration: none; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
+  .dot.live { background: var(--green); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; color: var(--muted); font-weight: normal; padding: 4px 6px 6px 0; }
+  td { padding: 6px 6px 6px 0; border-top: 1px solid #2c2c2c; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+
+<!-- ============ Login ============ -->
+<div id="login" hidden>
+  <h2 style="margin-top:40px">VitalTrack</h2>
+  <p class="m">Log in to continue</p>
+  <form id="loginForm">
+    <input id="email" type="email" placeholder="Email" autocomplete="username" required>
+    <input id="password" type="password" placeholder="Password" autocomplete="current-password" required>
+    <button type="submit">Log in</button>
+  </form>
+  <div class="m err" id="loginMsg"></div>
+</div>
+
+<!-- ============ App ============ -->
+<div id="app" hidden>
+  <h2>VitalTrack <a class="logout" id="logout">Log out</a></h2>
+
+  <div class="card">
+    <div class="k">User ID (6 digits)</div>
+    <input class="id" id="uid" placeholder="000000" maxlength="6" inputmode="numeric" autocomplete="off">
+    <button id="setUser">Search &amp; send to device</button>
+    <div class="m" id="msg"></div>
+    <div class="m" id="who"></div>
+  </div>
+
+  <div class="card"><div class="k">Status</div><div id="state">Loading...</div></div>
+  <div class="card"><div class="k">Body temperature</div><div class="v" id="t">--</div></div>
+  <div class="card"><div class="k">Blood oxygen (SpO2)</div><div class="v" id="o">--</div></div>
+  <div class="card"><div class="k">Heart rate</div><div class="v" id="h">--</div></div>
+  <div class="card"><div class="k">Last data sent to the database</div><div id="s">--</div></div>
+
+  <div class="card">
+    <div class="k">Recent scans</div>
+    <table>
+      <thead><tr><th>Time</th><th>Temp</th><th>SpO2</th><th>HR</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4">--</td></tr></tbody>
+    </table>
+  </div>
+  <div class="m err" id="appErr"></div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+<script>
+const SUPABASE_URL = 'https://yyrjhfeixxykicaivhen.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_ZnJepiGdZc4B2Jd7IxXXjA_2KgUt6hR ';        // publishable key (safe in a web page)
+const POLL_MS = 4000;
+const LIVE_WITHIN_S = 120;                       // a scan newer than this counts as "live"
+
+const sb = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+const $ = (id) => document.getElementById(id);
+let pollTimer = null;
+let firstLoad = true;
+
+function show(which) {
+  $('login').hidden = which !== 'login';
+  $('app').hidden = which !== 'app';
+}
+
+// ---------- time helpers ----------
+function ago(iso) {
+  const s = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return s + ' s ago';
+  if (s < 3600) return Math.floor(s / 60) + ' min ago';
+  if (s < 86400) return Math.floor(s / 3600) + ' h ago';
+  return new Date(iso).toLocaleDateString();
+}
+function clock(iso) {
+  return new Date(iso).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+const num = (v, d) => (v === null || v === undefined || isNaN(Number(v))) ? null : Number(v).toFixed(d);
+
+// ---------- drawing (pure: takes data, touches only the page) ----------
+function render(rows, user) {
+  const latest = rows && rows[0];
+
+  $('who').textContent = user.id
+    ? 'Current user: ' + (user.name || '(name unknown)') + ' (' + user.id + ')'
+    : 'No user set yet - scans are saved without a user.';
+
+  if (!latest) {
+    $('state').innerHTML = '<span class="dot"></span>No scans yet' + (user.id ? ' for this user' : '');
+    $('t').textContent = $('o').textContent = $('h').textContent = '--';
+    $('s').textContent = '--';
+    $('rows').innerHTML = '<tr><td colspan="4">--</td></tr>';
+    return;
+  }
+
+  const live = (Date.now() - new Date(latest.created_at).getTime()) / 1000 < LIVE_WITHIN_S;
+  $('state').innerHTML = '<span class="dot' + (live ? ' live' : '') + '"></span>' +
+    (live ? 'Scan received ' : 'Last scan ') + ago(latest.created_at);
+
+  const t = num(latest.temperature, 1), o = num(latest.spo2, 0), h = num(latest.heart_rate, 0);
+  $('t').textContent = t !== null ? t + ' °C' : '--';
+  $('o').textContent = o !== null ? o + ' %' : '--';
+  $('h').textContent = h !== null ? h + ' bpm' : '--';
+  $('s').textContent = clock(latest.created_at) + ' — ' +
+    (t !== null ? t + ' °C' : '--') + ', ' + (o !== null ? o + ' %' : '--') + ', ' + (h !== null ? h + ' bpm' : '--');
+
+  const tbody = $('rows');
+  tbody.textContent = '';
+  rows.forEach((r) => {
+    const tr = document.createElement('tr');
+    const cells = [clock(r.created_at),
+                   num(r.temperature, 1) !== null ? num(r.temperature, 1) + ' °C' : '--',
+                   num(r.spo2, 0) !== null ? num(r.spo2, 0) + ' %' : '--',
+                   num(r.heart_rate, 0) !== null ? num(r.heart_rate, 0) + ' bpm' : '--'];
+    cells.forEach((c) => { const td = document.createElement('td'); td.textContent = c; tr.appendChild(td); });
+    tbody.appendChild(tr);
+  });
+}
+
+// ---------- data ----------
+async function refresh() {
+  const ds = await sb.from('device_state').select('user_id,user_name').eq('id', 1).maybeSingle();
+  if (ds.error) { $('appErr').textContent = 'Could not read device_state: ' + ds.error.message; return; }
+  const user = { id: (ds.data && ds.data.user_id) || '', name: (ds.data && ds.data.user_name) || '' };
+  if (firstLoad) { $('uid').value = user.id; firstLoad = false; }
+
+  let q = sb.from('sensor_data').select('*').order('created_at', { ascending: false }).limit(20);
+  if (user.id) q = q.eq('user_id', user.id);
+  const res = await q;
+  if (res.error) { $('appErr').textContent = 'Could not read sensor_data: ' + res.error.message; return; }
+  $('appErr').textContent = '';
+  render(res.data, user);
+}
+
+async function setUser() {
+  const id = $('uid').value.trim();
+  const msg = $('msg');
+  msg.className = 'm';
+  if (id !== '' && !/^\d{6}$/.test(id)) { msg.className = 'm err'; msg.textContent = 'User ID must be exactly 6 digits.'; return; }
+
+  $('setUser').disabled = true;
+  msg.textContent = 'Searching...';
+  try {
+    let name = '';
+    if (id !== '') {
+      const r = await sb.rpc('get_user_name', { code: id });
+      if (r.error) throw new Error(r.error.message);
+      if (!r.data) { msg.className = 'm err'; msg.textContent = 'ID not found. Check the 6-digit ID in the app.'; return; }
+      name = r.data;
+    }
+    const w = await sb.from('device_state').upsert({ id: 1, user_id: id, user_name: name, updated_at: new Date().toISOString() });
+    if (w.error) throw new Error(w.error.message);
+    msg.textContent = id ? 'Found! The device will switch to ' + name + ' within about 15 seconds.' : 'User cleared.';
+    await refresh();
+  } catch (e) {
+    msg.className = 'm err';
+    msg.textContent = 'Failed: ' + e.message;
+  } finally {
+    $('setUser').disabled = false;
+  }
+}
+
+// ---------- session ----------
+function startApp() {
+  show('app');
+  firstLoad = true;
+  refresh();
+  clearInterval(pollTimer);
+  pollTimer = setInterval(refresh, POLL_MS);
+}
+function stopApp() { clearInterval(pollTimer); pollTimer = null; }
+
+$('uid').addEventListener('input', (e) => { e.target.value = e.target.value.replace(/\D/g, ''); });
+$('uid').addEventListener('keydown', (e) => { if (e.key === 'Enter') setUser(); });
+$('setUser').addEventListener('click', setUser);
+
+$('loginForm').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const msg = $('loginMsg');
+  msg.textContent = 'Signing in...';
+  const { error } = await sb.auth.signInWithPassword({ email: $('email').value.trim(), password: $('password').value });
+  if (error) { msg.textContent = 'Wrong email or password.'; return; }
+  msg.textContent = '';
+  startApp();
+});
+$('logout').addEventListener('click', () => sb.auth.signOut());
+
+sb.auth.onAuthStateChange((event, session) => { if (!session) { stopApp(); show('login'); } });
+sb.auth.getSession().then(({ data }) => { if (data.session) startApp(); else show('login'); });
+</script>
+</body>
+</html>
